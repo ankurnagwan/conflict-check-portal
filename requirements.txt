@@ -1,0 +1,14 @@
+# Python 3.10+  (3.11/3.12 recommended). After your first clean run, `pip freeze > requirements.lock`
+# and install from the lock file on the server so upgrades are always deliberate.
+SQLAlchemy>=2.0,<2.1
+alembic>=1.13,<2
+bcrypt>=4.1,<6
+openpyxl>=3.1,<4
+tzdata            # required on Windows for Asia/Kolkata
+# Needed from Part 2/3 onward:
+streamlit>=1.40,<2
+plotly>=5.20,<7
+pandas>=2.1,<3
+rapidfuzz>=3.6,<4
+reportlab>=4.0,<5      # PDF Approval Certificate
+xlsxwriter>=3.1,<4     # Excel sync engine
