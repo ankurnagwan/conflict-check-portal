@@ -72,7 +72,7 @@ PERMISSIONS: dict[str, frozenset] = {
     "decide_conflict":     frozenset({R.ROLE_RISK_LEAD}),
     "record_alignment":    frozenset({R.ROLE_RISK_LEAD}),
     "grant_acceptance":    frozenset({R.ROLE_RISK_LEAD}),
-    "export_reports":      frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD, R.ROLE_AUDITOR}),
+    "export_reports":      frozenset(config.ROLES),   # scope is enforced in the query: Members export ONLY their own lines
     "view_audit":          frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD, R.ROLE_AUDITOR}),
     "verify_audit":        frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD, R.ROLE_AUDITOR}),
     "view_diagnostics":    frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD}),   # health, error log, backups
@@ -112,6 +112,16 @@ def apply_service_line_scope(stmt, user: SessionUser, column):
     if not user.service_line_ids:
         return stmt.where(false())
     return stmt.where(column.in_(user.service_line_ids))
+
+
+def apply_check_visibility(stmt, user: SessionUser, service_line_col, partner_col):
+    """Detail-view visibility: the user's service lines PLUS any check where they are the designated
+    aligned partner (so a partner from another line can open it to sign off). Lists, KPIs, reports and
+    exports never use this: they stay strictly service-line scoped."""
+    from sqlalchemy import or_
+    if user.service_line_ids is None:
+        return stmt
+    return stmt.where(or_(service_line_col.in_(user.service_line_ids), partner_col == user.id))
 
 
 def assert_service_line_access(user: SessionUser, service_line_id: int) -> None:

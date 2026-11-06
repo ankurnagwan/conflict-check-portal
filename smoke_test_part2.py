@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from streamlit.testing.v1 import AppTest        # noqa: E402
 
-import app, audit, auth, config, database        # noqa: E402
+import app, audit, auth, config, database, workflow   # noqa: E402
 from sqlalchemy import select                    # noqa: E402
 
 PASS, FAIL = [], []
@@ -51,10 +51,17 @@ for uname, name, role, lines, partner in [
 U = {n: auth.authenticate(n, PW).user for n in ("aud.member", "adv.member", "risk.one", "risk.two", "audit.or")}
 check("test users can log in", all(U.values()))
 sl = {code: i for i, code, _ in app.allowed_service_lines(admin)}
+PDF = b"%PDF-1.4 test "
+
+
+def docs(ptype, scope, required_only=True):
+    return [{"doc_type": k, "filename": f"{k}.pdf", "data": PDF + k.encode()}
+            for k, req in workflow.required_docs(ptype, scope) if req or not required_only]
 
 # ------------------------------------------------------------------ service layer
 r1 = app.create_check(U["aud.member"], service_line_id=sl["AUD"], party_type="Client", scope="Domestic",
                       party_name="ABC Pvt Ltd", pan="abcde1234f", submit=True,
+                      uploads=docs("Client", "Domestic"), confirm_review=True,
                       related=[{"name": "ABC Holdings", "relationship": "Parent", "identifier": ""}])
 check("create + submit returns reference", r1["reference_no"].endswith("/AUD/0001") and r1["status"] == "SUBMITTED", r1)
 r2 = app.create_check(U["adv.member"], service_line_id=sl["ADV"], party_type="Vendor", scope="Global",
@@ -88,12 +95,15 @@ check("detail load re-applies scope", app.get_check_detail(U["aud.member"], r2["
 
 check("only the maker may withdraw", raises(auth.PermissionDenied, app.maker_action, U["adv.member"], r1["id"], "WITHDRAWN", "x"))
 check("withdraw needs a reason", raises(app.FormInvalid, app.maker_action, U["aud.member"], r1["id"], "WITHDRAWN", ""))
-check("draft -> submitted by maker", app.maker_action(U["adv.member"], r2["id"], "SUBMITTED") == r2["reference_no"])
-check("cannot re-submit a submitted check", raises(app.FormInvalid, app.maker_action, U["adv.member"], r2["id"], "SUBMITTED"))
+workflow.attach_documents(U["adv.member"], r2["id"], docs("Vendor", "Global"))
+check("draft -> submitted by maker (needs docs + confirmation)",
+      app.maker_action(U["adv.member"], r2["id"], "SUBMITTED", confirmed=True) == r2["reference_no"])
+check("cannot re-submit a submitted check", raises(app.FormInvalid, app.maker_action, U["adv.member"], r2["id"], "SUBMITTED", None, True))
 
 # maker-checker with a Risk Lead as maker
 r3 = app.create_check(U["risk.one"], service_line_id=sl["FOR"], party_type="Client", scope="Domestic",
-                      party_name="Self Raised Ltd", pan="AAAPL1234C", submit=True)
+                      party_name="Self Raised Ltd", pan="AAAPL1234C", submit=True,
+                      uploads=docs("Client", "Domestic"), confirm_review=True)
 check("maker-checker: Risk Lead cannot review own check", not app.review_eligibility(U["risk.one"], U["risk.one"].id)[0])
 check("maker-checker: a different Risk Lead can", app.review_eligibility(U["risk.two"], U["risk.one"].id)[0])
 check("members are not reviewers", not app.review_eligibility(U["aud.member"], U["adv.member"].id)[0])
@@ -168,7 +178,7 @@ for page, uname in [("page_diagnostics", "aud.member"), ("page_admin", "risk.one
 t = AppTest.from_function(run_page, args=("page_diagnostics", UIDS["audit.or"]), default_timeout=60); t.run()
 check("auditor sees chain tab only (no health/backup tabs)", len(t.tabs) == 1, [x.label for x in t.tabs])
 t = AppTest.from_function(run_page, args=("page_diagnostics", UIDS["risk.one"]), default_timeout=60); t.run()
-check("risk lead sees all four diagnostics tabs", len(t.tabs) == 4, [x.label for x in t.tabs])
+check("risk lead sees all five diagnostics tabs", len(t.tabs) == 5, [x.label for x in t.tabs])
 verify_btn = [b for b in t.button if "Verify audit chain" in b.label]
 verify_btn[0].click(); t.run()
 check("verify audit chain button works and reports intact", not t.exception and any("intact" in s.value for s in t.success),
@@ -178,16 +188,16 @@ check("verify audit chain button works and reports intact", not t.exception and 
 t = AppTest.from_function(run_page, args=("page_data_entry", UIDS["aud.member"]), default_timeout=60); t.run()
 t.text_input(key="de_name_0").set_value("Wayne Enterprises Limited")
 t.text_input(key="de_pan_0").set_value("AAACW1234Q")
-[b for b in t.button if "Submit for review" in b.label][0].click(); t.run()
-check("form submit through the UI succeeds", not t.exception and not t.error, (t.exception, [e.value for e in t.error]))
+[b for b in t.button if "Save as draft" in b.label][0].click(); t.run()
+check("draft saved through the UI", not t.exception and not t.error, (t.exception, [e.value for e in t.error]))
 with database.read_scope() as s:
     made = s.scalar(select(database.ConflictCheck).where(database.ConflictCheck.party_name == "Wayne Enterprises Limited"))
-check("UI submission persisted as SUBMITTED by the right maker",
-      made is not None and made.conflict_status == "SUBMITTED" and made.requested_by_id == U["aud.member"].id)
+check("UI draft persisted as DRAFT by the right maker",
+      made is not None and made.conflict_status == "DRAFT" and made.requested_by_id == U["aud.member"].id)
 
 t = AppTest.from_function(run_page, args=("page_data_entry", UIDS["aud.member"]), default_timeout=60); t.run()
 t.text_input(key="de_name_0").set_value("")
-[b for b in t.button if "Submit for review" in b.label][0].click(); t.run()
+[b for b in t.button if "Save as draft" in b.label][0].click(); t.run()
 check("invalid form shows inline errors, saves nothing", len(t.error) >= 1 and not t.exception, [e.value for e in t.error])
 
 def run_detail(uid, check_id):
@@ -197,16 +207,16 @@ def run_detail(uid, check_id):
     _a.render_detail(_a.auth.load_session_user(uid), check_id)
 
 
-for uname, cid, expect_tabs, expect_warn in [("risk.one", r1["id"], 3, False), ("aud.member", r1["id"], 2, False),
-                                              ("aud.member", r2["id"], 0, True), ("risk.two", r3["id"], 3, False)]:
+for uname, cid, expect_tabs, expect_warn in [("risk.one", r1["id"], 4, False), ("aud.member", r1["id"], 3, False),
+                                              ("aud.member", r2["id"], 0, True), ("risk.two", r3["id"], 4, False)]:
     d = AppTest.from_function(run_detail, args=(UIDS[uname], cid), default_timeout=60); d.run()
     check(f"record detail for {uname} on #{cid}: no exception, {expect_tabs} tabs" + (", access refused" if expect_warn else ""),
-          not d.exception and len(d.tabs) == expect_tabs and (len(d.warning) == 1) == expect_warn, (d.exception, len(d.tabs)))
+          not d.exception and len(d.tabs) == expect_tabs and any("not available to you" in w.value for w in d.warning) == expect_warn, (d.exception, len(d.tabs), [w.value for w in d.warning]))
 d = AppTest.from_function(run_detail, args=(UIDS["risk.one"], r3["id"]), default_timeout=60); d.run()
 check("own submitted check shows maker-checker block to its Risk Lead maker",
       any("Maker-checker" in w.value for w in d.warning), [w.value for w in d.warning])
 d = AppTest.from_function(run_detail, args=(UIDS["risk.two"], r3["id"]), default_timeout=60); d.run()
-check("other Risk Lead is shown as eligible", any("eligible" in i.value for i in d.info), [i.value for i in d.info])
+check("other Risk Lead gets the decision controls", any("Record decision" in b.label for b in d.button), [b.label for b in d.button])
 d = AppTest.from_function(run_detail, args=(UIDS["adv.member"], r2["id"]), default_timeout=60); d.run()
 wd = [b for b in d.button if b.label == "Withdraw"]
 d.text_input(key=f"wd_reason_{r2['id']}").set_value("Client dropped the engagement"); wd[0].click(); d.run()

@@ -17,7 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 APP_NAME = "Enterprise Conflict Check & Client Acceptance Portal"
-APP_VERSION = "1.0.0-part1"
+APP_VERSION = "1.0.0-part3"
 
 # --------------------------------------------------------------------------- paths
 BASE_DIR = Path(__file__).resolve().parent
@@ -108,6 +108,49 @@ DEFAULT_SERVICE_LINES = [
 # --------------------------------------------------------------------------- proofs
 MAX_UPLOAD_MB = 25
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".msg", ".eml"}
+
+REQUIRE_DOCS_ON_SUBMIT = True     # all REQUIRED documents must be attached before a check can be submitted
+REQUIRE_ID_ON_SUBMIT = True       # name-only matching is weak: need >=1 identifier to submit
+
+# Document keys -> human label. APPROVAL_CERTIFICATE is system-generated only.
+DOC_LABELS = {
+    "PAN": "PAN card", "TAN": "TAN allotment letter", "GST": "GST registration certificate",
+    "MSME": "MSME / Udyam certificate", "COI": "Certificate of Incorporation (COI)",
+    "CANCELLED_CHEQUE": "Cancelled cheque", "VENDOR_QUOTE": "Vendor quotation",
+    "TRC": "Tax Residency Certificate (TRC)", "SIGNED_EL": "Signed Engagement Letter (EL)",
+    "SIGNED_PO_AGREEMENT": "Signed PO / Agreement", "ALIGNMENT_PROOF": "Partner alignment proof",
+    "OTHER": "Other supporting document", "APPROVAL_CERTIFICATE": "Approval certificate (system)",
+}
+# (party_type, scope) -> [(doc_key, required)].  "Global" = international. EDIT TO MATCH FIRM POLICY.
+DOC_REQUIREMENTS = {
+    ("Client", "Domestic"): [("PAN", True), ("TAN", True), ("GST", True), ("MSME", False), ("COI", True), ("SIGNED_EL", True)],
+    ("Client", "Global"):   [("TRC", True), ("COI", True), ("SIGNED_EL", True)],
+    ("Vendor", "Domestic"): [("PAN", True), ("TAN", False), ("GST", True), ("MSME", False), ("COI", True),
+                             ("CANCELLED_CHEQUE", True), ("VENDOR_QUOTE", True), ("SIGNED_PO_AGREEMENT", True)],
+    ("Vendor", "Global"):   [("TRC", True), ("COI", True), ("CANCELLED_CHEQUE", True), ("VENDOR_QUOTE", True),
+                             ("SIGNED_PO_AGREEMENT", True)],
+}
+MULTI_DOC_TYPES = {"OTHER", "ALIGNMENT_PROOF"}   # these may hold several files; every other type is replace-on-upload
+GST_ADDRESS_WARNING = ("Billing will be made on the GST Address so kindly ensure that your EL address and GST address "
+                       "are identical to avoid rejection. Please perform a final check of your documents before submitting.")
+FINAL_REVIEW_TEXT = ("I have performed a final check of all details and documents, and confirm they are accurate, "
+                     "complete and that the EL address and GST address are identical.")
+
+# --------------------------------------------------------------------------- fuzzy matching (rapidfuzz)
+FUZZY_THRESHOLD = 85      # % similarity that raises a "possible match"
+FUZZY_HIGH = 95           # % at/above which it is flagged "likely duplicate"
+FUZZY_MIN_LEN = 3         # ignore names shorter than this after normalisation
+
+# --------------------------------------------------------------------------- Excel sync
+EXCEL_MASTER_NAME = "Master_Conflict_Tracker.xlsx"
+EXCEL_DIR = EXPORT_DIR
+EXCEL_PER_LINE = True                         # also write one workbook per service line (isolation-friendly)
+EXCEL_DEBOUNCE_SECONDS = 2.0                  # coalesce bursts of saves into one rebuild
+EXCEL_RETRY_SECONDS = 30                      # retry delay when the file is locked (open in Excel)
+EXCEL_REPLACE_ATTEMPTS = 4                    # quick in-line retries of the atomic swap before queueing a retry
+EXCEL_REPLACE_DELAY = 1.0
+# Path prefix that Excel users see for proof files (e.g. a shared folder \\server\ccp_proofs).
+EXCEL_LINK_ROOT = os.environ.get("CCP_LINK_ROOT") or str(PROOF_ROOT)
 
 # --------------------------------------------------------------------------- backups
 BACKUP_DAILY_KEEP_DAYS = 14

@@ -11,11 +11,14 @@ Structure
     3. Pages           Dashboard, Data Entry, Records, Reports, Diagnostics, Administration.
     4. main()          login gate -> forced password change -> sidebar -> navigation.
 
+Part 3 adds: document upload + verification UI, the two-option decision workflow with partner sign-off,
+PDF certificate access, live fuzzy screening, the Action Queue, strict per-line CSV export, Excel sync status.
+The business rules themselves live in workflow.py; this file is screens only.
+
 Audit: all events go through audit.log_event() (the "log_audit_event" of the brief).
 """
 from __future__ import annotations
 
-import io
 import json
 import platform
 import time
@@ -36,31 +39,26 @@ import auth
 import backup
 import config
 import database
-from database import (AuditLog, ConflictCheck, DatabaseBusy, ProofDocument, RelatedParty, RuleViolation,
-                      ServiceLine, User, next_reference_no, normalize_id, normalize_name, read_scope,
-                      to_ist, validate_identifier, write_scope)
+import excel_sync
+import matching
+import workflow
+from database import (AuditLog, ConflictCheck, DatabaseBusy, ProofDocument, RuleViolation, ServiceLine, User,
+                      normalize_id, normalize_name, read_scope, write_scope)
+# Re-exported so existing tests / callers keep working: the rules live in workflow.py.
+from workflow import (FormInvalid, create_check, get_check_detail, maker_action, pretty,  # noqa: F401
+                      review_eligibility)
 
 log = config.get_logger("app")
 
 PENDING_STATES = ("SUBMITTED", "ALIGNMENT_PENDING", "ALIGNMENT_CONFIRMED")
 OVERDUE_DAYS = 5                      # open checks older than this are flagged
-REQUIRE_ID_ON_SUBMIT = True           # name-only matching is weak: need >=1 identifier to submit
 MAX_RECORDS_TABLE = 5000
 SCOPE_COLORS = {"Domestic": "#2563eb", "Global": "#f59e0b"}
-# What the maker (requester) may do themselves. Decisions are the Risk Lead's (Part 3).
-MAKER_TRANSITIONS = {"SUBMITTED": {"DRAFT"}, "WITHDRAWN": {"DRAFT", "SUBMITTED"}}
+UPLOAD_TYPES = [e.lstrip(".") for e in sorted(config.ALLOWED_UPLOAD_EXTENSIONS)]
+_ist_naive = workflow.ist_naive
 
 
-def pretty(v) -> str:
-    return str(v).replace("_", " ").title() if v else ""
-
-
-# ============================================================================ 1. SERVICE LAYER
-class FormInvalid(RuleViolation):
-    def __init__(self, errors: list[str]):
-        super().__init__("; ".join(errors))
-        self.errors = errors
-
+# ============================================================================ 1. QUERY LAYER (strictly service-line scoped)
 
 @dataclass(frozen=True)
 class Filters:
@@ -74,10 +72,6 @@ class Filters:
 
 def _ist_day_start_utc(d: date) -> datetime:
     return datetime.combine(d, dtime.min, tzinfo=config.IST).astimezone(timezone.utc).replace(tzinfo=None)
-
-
-def _ist_naive(dt: Optional[datetime]):
-    return to_ist(dt).replace(tzinfo=None) if dt else None
 
 
 def _like_escape(s: str) -> str:
@@ -137,154 +131,6 @@ def fetch_checks(user: auth.SessionUser, f: Filters, limit: Optional[int] = None
     now_ist = datetime.now(config.IST).replace(tzinfo=None)
     df["age_days"] = (now_ist - df["created_at"]).dt.days if len(df) else pd.Series(dtype="float")
     return df
-
-
-def find_exact_matches(s, *, norm_name: str, pan, gstin, cin, tax_id, limit: int = 20) -> list[dict]:
-    """Firm-wide exact-match scan. DELIBERATELY NOT service-line scoped: a conflict check is only
-    meaningful against the whole firm. What is DISPLAYED is role-limited by the caller.
-    (Part 3 adds rapidfuzz fuzzy matching on top of this.)"""
-    out: list[dict] = []
-    conds = []
-    if norm_name: conds.append(ConflictCheck.normalized_name == norm_name)
-    for col, val in ((ConflictCheck.pan, pan), (ConflictCheck.gstin, gstin),
-                     (ConflictCheck.cin, cin), (ConflictCheck.tax_id, tax_id)):
-        if val: conds.append(col == val)
-    if conds:
-        for r in s.execute(select(ConflictCheck.reference_no, ConflictCheck.party_name, ServiceLine.code,
-                                  ConflictCheck.conflict_status)
-                           .join(ServiceLine, ServiceLine.id == ConflictCheck.service_line_id)
-                           .where(ConflictCheck.is_deleted.is_(False), or_(*conds)).limit(limit)):
-            out.append({"reference_no": r[0], "party_name": r[1], "service_line": r[2],
-                        "status": r[3], "matched_on": "Name / identifier"})
-    if norm_name:
-        for r in s.execute(select(ConflictCheck.reference_no, ConflictCheck.party_name, ServiceLine.code,
-                                  ConflictCheck.conflict_status)
-                           .join(RelatedParty, RelatedParty.check_id == ConflictCheck.id)
-                           .join(ServiceLine, ServiceLine.id == ConflictCheck.service_line_id)
-                           .where(ConflictCheck.is_deleted.is_(False),
-                                  RelatedParty.normalized_name == norm_name).limit(limit)):
-            out.append({"reference_no": r[0], "party_name": r[1], "service_line": r[2],
-                        "status": r[3], "matched_on": "Listed as related party"})
-    return out
-
-
-def create_check(user: auth.SessionUser, *, service_line_id: int, party_type: str, scope: str,
-                 party_name: str, pan=None, gstin=None, cin=None, tax_id=None, country=None,
-                 description=None, related: Optional[list[dict]] = None, submit: bool = False) -> dict:
-    auth.require(user, "create_check")
-    auth.assert_service_line_access(user, service_line_id)
-    name = (party_name or "").strip()
-    pan, gstin, cin, tax_id = (normalize_id(x) for x in (pan, gstin, cin, tax_id))
-    errors: list[str] = []
-    if not name: errors.append("Entity name is required.")
-    if len(name) > 300: errors.append("Entity name is too long (max 300 characters).")
-    if party_type not in config.PARTY_TYPES: errors.append("Choose Client or Vendor.")
-    if scope not in config.SCOPES: errors.append("Choose Domestic or Global.")
-    if scope == "Domestic":
-        tax_id, country = None, None
-        for kind, val in (("pan", pan), ("gstin", gstin), ("cin", cin)):
-            if val and not validate_identifier(kind, val):
-                errors.append(f"{kind.upper()} '{val}' is not in a valid format.")
-    else:
-        pan = gstin = cin = None
-        if not (country or "").strip(): errors.append("Country is required for Global engagements.")
-    if submit and REQUIRE_ID_ON_SUBMIT and not any((pan, gstin, cin, tax_id)):
-        errors.append("At least one identifier (PAN / GSTIN / CIN, or Tax ID for Global) is required to submit.")
-    rel_rows = [{"name": str(r.get("name") or "").strip(), "relationship": str(r.get("relationship") or "").strip(),
-                 "identifier": str(r.get("identifier") or "").strip()}
-                for r in (related or []) if str(r.get("name") or "").strip()][:25]
-    if errors:
-        raise FormInvalid(errors)
-
-    with write_scope() as s:
-        sl = s.get(ServiceLine, service_line_id)
-        if sl is None or not sl.is_active:
-            raise FormInvalid(["The selected service line is not available."])
-        matches = find_exact_matches(s, norm_name=normalize_name(name), pan=pan, gstin=gstin, cin=cin, tax_id=tax_id)
-        chk = ConflictCheck(reference_no=next_reference_no(s, sl.code), service_line_id=sl.id,
-                            party_type=party_type, scope=scope, party_name=name, pan=pan, gstin=gstin,
-                            cin=cin, tax_id=tax_id, country=(country or "").strip() or None,
-                            engagement_description=(description or "").strip() or None,
-                            requested_by_id=user.id, conflict_status="DRAFT", acceptance_status="LOCKED")
-        s.add(chk)
-        s.flush()
-        for r in rel_rows:
-            s.add(RelatedParty(check_id=chk.id, name=r["name"], relationship_type=r["relationship"] or None,
-                               identifier=r["identifier"] or None))
-        audit.log_event(s, user=user, action="CHECK_CREATED", entity_type="conflict_check", entity_id=chk.id,
-                        new={**audit.model_snapshot(chk), "related_parties": rel_rows,
-                             "possible_matches": [m["reference_no"] for m in matches]})
-        if submit:
-            chk.conflict_status = "SUBMITTED"
-            audit.log_event(s, user=user, action="CHECK_SUBMITTED", entity_type="conflict_check",
-                            entity_id=chk.id, old={"conflict_status": "DRAFT"},
-                            new={"conflict_status": "SUBMITTED"})
-        return {"id": chk.id, "reference_no": chk.reference_no, "status": chk.conflict_status, "matches": matches}
-
-
-def maker_action(user: auth.SessionUser, check_id: int, new_status: str, reason: Optional[str] = None) -> str:
-    """Submit a draft / withdraw. Only the person who raised the check (the maker)."""
-    with write_scope() as s:
-        stmt = auth.apply_service_line_scope(
-            select(ConflictCheck).where(ConflictCheck.id == check_id, ConflictCheck.is_deleted.is_(False)),
-            user, ConflictCheck.service_line_id)
-        c = s.scalar(stmt)
-        if c is None:
-            raise auth.PermissionDenied("Record not found or not accessible.")
-        if c.requested_by_id != user.id:
-            raise auth.PermissionDenied("Only the person who raised this check can do that.")
-        old = c.conflict_status
-        if old not in MAKER_TRANSITIONS.get(new_status, set()) or new_status not in config.CONFLICT_TRANSITIONS.get(old, set()):
-            raise FormInvalid([f"A {pretty(old)} check cannot be moved to {pretty(new_status)}."])
-        if new_status == "WITHDRAWN" and not (reason or "").strip():
-            raise FormInvalid(["A reason is required to withdraw a check."])
-        if new_status == "SUBMITTED" and REQUIRE_ID_ON_SUBMIT and not any((c.pan, c.gstin, c.cin, c.tax_id)):
-            raise FormInvalid(["Add at least one identifier before submitting (edit is coming in Part 3, create a new draft for now)."])
-        c.conflict_status = new_status
-        audit.log_event(s, user=user, action="CHECK_SUBMITTED" if new_status == "SUBMITTED" else "CHECK_WITHDRAWN",
-                        entity_type="conflict_check", entity_id=c.id, old={"conflict_status": old},
-                        new={"conflict_status": new_status}, reason=(reason or None))
-        return c.reference_no
-
-
-def review_eligibility(user: auth.SessionUser, requested_by_id: int) -> tuple[bool, str]:
-    """Maker-checker gate. Part 3's Approve / Partner-Alignment buttons call exactly this."""
-    if not auth.can(user, "decide_conflict"):
-        return False, "Only a Risk Lead can review this check."
-    try:
-        auth.assert_maker_checker(requested_by_id, user.id)
-    except auth.PermissionDenied as exc:
-        return False, f"{exc} Another Risk Lead must review it."
-    return True, "You are eligible to review this check (decision buttons arrive in Part 3)."
-
-
-def get_check_detail(user: auth.SessionUser, check_id: int) -> Optional[dict]:
-    with read_scope() as s:
-        c = s.scalar(auth.apply_service_line_scope(
-            select(ConflictCheck).where(ConflictCheck.id == check_id, ConflictCheck.is_deleted.is_(False)),
-            user, ConflictCheck.service_line_id))
-        if c is None:
-            return None
-        uids = {x for x in (c.requested_by_id, c.decided_by_id, c.aligned_partner_id, c.accepted_by_id) if x}
-        names = {r[0]: r[1] for r in s.execute(select(User.id, User.full_name).where(User.id.in_(uids)))} if uids else {}
-        sl = s.get(ServiceLine, c.service_line_id)
-        rel = [{"Name": r.name, "Relationship": r.relationship_type, "Identifier": r.identifier}
-               for r in s.scalars(select(RelatedParty).where(RelatedParty.check_id == c.id))]
-        prf = [{"Type": p.doc_type, "File": p.original_filename or p.external_path or p.stored_relpath,
-                "Uploaded": _ist_naive(p.uploaded_at)}
-               for p in s.scalars(select(ProofDocument).where(ProofDocument.check_id == c.id,
-                                                              ProofDocument.is_deleted.is_(False)))]
-        return {
-            "id": c.id, "reference_no": c.reference_no, "service_line": f"{sl.code} - {sl.name}",
-            "party_name": c.party_name, "party_type": c.party_type, "scope": c.scope, "country": c.country,
-            "pan": c.pan, "gstin": c.gstin, "cin": c.cin, "tax_id": c.tax_id,
-            "description": c.engagement_description, "status": c.conflict_status, "decision": c.decision,
-            "acceptance": c.acceptance_status, "requested_by_id": c.requested_by_id,
-            "requested_by": names.get(c.requested_by_id), "decided_by": names.get(c.decided_by_id),
-            "decided_at": _ist_naive(c.decided_at), "decision_notes": c.decision_notes,
-            "aligned_partner": names.get(c.aligned_partner_id) or c.aligned_partner_name,
-            "created_at": _ist_naive(c.created_at), "source": c.source, "related": rel, "proofs": prf,
-        }
 
 
 def recent_audit(limit: int = 200, action_like: str = "") -> pd.DataFrame:
@@ -349,6 +195,8 @@ def run_action(fn, *args, **kwargs):
         st.error(str(exc)); st.toast(str(exc), icon="⛔")
     except DatabaseBusy as exc:
         st.warning(str(exc)); st.toast(str(exc), icon="⏳")
+    except RuleViolation as exc:                    # e.g. document integrity failure
+        st.error(str(exc)); st.toast(str(exc), icon="🚨")
     except StaleDataError:
         st.warning("Someone else changed this record while you were working. Reload the page and try again.")
     except Exception:
@@ -393,6 +241,8 @@ def bootstrap() -> bool:
     database.init_db()
     auth.bootstrap_admin()
     backup.start_scheduler()
+    excel_sync.start()
+    excel_sync.request_sync("startup")
     return True
 
 
@@ -401,6 +251,9 @@ def inject_css() -> None:
     .block-container {padding-top: 1.6rem; max-width: 1500px;}
     [data-testid="stMetricValue"] {font-size: 1.9rem; font-weight: 650;}
     [data-testid="stMetricLabel"] p {font-size: .85rem; opacity: .75; text-transform: uppercase; letter-spacing: .03em;}
+    .ccp-banner {border: 2px solid #f59e0b; background: rgba(245,158,11,.12); border-radius: 10px;
+                 padding: .9rem 1.1rem; margin: .6rem 0 .8rem 0; font-size: 1.02rem; line-height: 1.45;}
+    .ccp-banner b {color: #b45309;}
     </style>""", unsafe_allow_html=True)
 
 
@@ -501,24 +354,66 @@ def describe_filters(f: Filters) -> dict:
     return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in asdict(f).items() if v not in (None, (), "", "All")}
 
 
-def _log_export(kind: str, rows: int, filters: dict) -> None:
+def _log_export(kind: str, rows: int, filters: dict, lines: list) -> None:
     try:
         with write_scope() as s:
-            audit.log_event(s, user=st.session_state.get("_user"), action="RECORDS_EXPORTED",
-                            entity_type="export", entity_id=kind, new={"rows": rows, "filters": filters})
+            audit.log_event(s, user=st.session_state.get("_user"), action="RECORDS_EXPORTED", entity_type="export",
+                            entity_id=kind, new={"rows": rows, "filters": filters, "service_lines": lines})
     except Exception:
         log.exception("Could not audit-log an export")
         st.toast("Export was not recorded in the audit log - see error.log", icon="❌")
 
 
-def export_button(df: pd.DataFrame, kind: str, f: Filters, label: str = "⬇️ Export CSV") -> None:
-    user = st.session_state.get("_user")
+def _assigned_codes(user: auth.SessionUser) -> Optional[set]:
+    """Codes of EVERY service line assigned to the user (active or not); None = unrestricted role."""
+    if user.service_line_ids is None:
+        return None
+    with read_scope() as s:
+        return set(s.scalars(select(ServiceLine.code).where(ServiceLine.id.in_(list(user.service_line_ids)))))
+
+
+def export_dataframe(user: auth.SessionUser, f: Filters) -> pd.DataFrame:
+    """Fresh SERVER-SIDE query for export. A Service Line Member can only ever export rows of their own
+    assigned lines: scoped in SQL by fetch_checks(), then re-verified here (defence in depth), never taken from
+    what happens to be on screen."""
+    auth.require(user, "export_reports")
+    df = fetch_checks(user, f)
+    codes = _assigned_codes(user)
+    if codes is not None:
+        df = df[df["service_line"].isin(codes)]
+    return df.drop(columns=["id", "age_days"])
+
+
+def summary_pivot(user: auth.SessionUser, f: Filters) -> pd.DataFrame:
+    df = fetch_checks(user, f)
+    piv = pd.pivot_table(df, index="service_line", columns="conflict_status", values="id", aggfunc="count", fill_value=0)
+    piv.columns = [pretty(c) for c in piv.columns]
+    piv["Total"] = piv.sum(axis=1)
+    piv.loc["TOTAL"] = piv.sum()
+    return piv
+
+
+def export_button(user: auth.SessionUser, f: Filters, kind: str, builder, label: str = "CSV") -> None:
+    """Two steps: 'Prepare' runs the strict query, then 'Download' serves it and writes the audit entry."""
     if not auth.can(user, "export_reports"):
-        st.caption("CSV export is available to Admin, Risk Lead and Auditor roles.")
+        st.caption("You do not have permission to export.")
         return
-    st.download_button(label, csv_safe(df).to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"{kind}_{datetime.now(config.IST):%Y%m%d_%H%M}.csv", mime="text/csv",
-                       key=f"dl_{kind}", on_click=_log_export, args=(kind, len(df), describe_filters(f)))
+    desc = describe_filters(f)
+    key = f"_exp_{kind}"
+    if st.button(f"📤 Prepare {label} export", key=f"prep_{kind}"):
+        ok, df = run_action(builder)
+        if ok:
+            safe = csv_safe(df)
+            st.session_state[key] = {"csv": safe.to_csv(index=False).encode("utf-8-sig"), "rows": len(df), "desc": desc,
+                                     "lines": sorted(set(df["service_line"])) if "service_line" in df else []}
+    ex = st.session_state.get(key)
+    if ex and ex["desc"] == desc:
+        scope_note = "" if user.service_line_ids is None else " (your assigned service lines only)"
+        st.download_button(f"⬇️ Download {label} ({ex['rows']:,} rows){scope_note}", ex["csv"],
+                           file_name=f"{kind}_{datetime.now(config.IST):%Y%m%d_%H%M}.csv", mime="text/csv",
+                           key=f"dl_{kind}", on_click=_log_export, args=(kind, ex["rows"], desc, ex["lines"]))
+    elif ex:
+        st.caption("Filters changed: prepare the export again.")
 
 
 # ============================================================================ 3. PAGES
@@ -552,6 +447,10 @@ def page_dashboard() -> None:
     user = _page_user("view_records")
     f = _filters()
     st.title("📊 Executive Dashboard")
+    q = workflow.fetch_queue(user)
+    todo = int((~q["action"].str.startswith("Waiting")).sum()) if len(q) else 0
+    if todo:
+        st.info(f"📥 **{todo} item(s) need your action.** Open **Action Queue** in the sidebar.")
     df = fetch_checks(user, f)
     now = datetime.now(config.IST).replace(tzinfo=None)
     pending = df[df["conflict_status"].isin(PENDING_STATES)]
@@ -594,6 +493,32 @@ def page_dashboard() -> None:
         "conflict_status": "Status", "created_at": st.column_config.DatetimeColumn("Created", format="DD MMM YYYY, HH:mm")})
 
 
+def gst_banner() -> None:
+    st.markdown(f'<div class="ccp-banner">⚠️ <b>Please read before submitting</b><br>{config.GST_ADDRESS_WARNING}</div>',
+                unsafe_allow_html=True)
+
+
+def render_screening(user: auth.SessionUser, matches: list[dict], hidden: int, typed: bool) -> None:
+    """Live duplicate / conflict flags. Details only for lines the user may see; elsewhere just a count."""
+    if not matches and not hidden:
+        if typed:
+            st.caption("✅ No similar entities found across the firm.")
+        return
+    high = any(m["level"] == matching.LEVEL_HIGH for m in matches)
+    (st.error if high else st.warning)(
+        f"{'🚨 Likely duplicate' if high else '⚠️ Possible match'}: {len(matches) + hidden} existing record(s) "
+        "look similar. Please review before submitting.")
+    if matches:
+        mdf = pd.DataFrame([{"Reference": m["reference_no"], "Entity": m["party_name"], "Line": m["service_line"],
+                             "Status": pretty(m["status"]), "Match": m["score"], "Flag": m["level"],
+                             "Why": "; ".join(m["reasons"])} for m in matches])
+        st.dataframe(mdf, hide_index=True, column_config={
+            "Match": st.column_config.ProgressColumn("Match", min_value=0, max_value=100, format="%d%%")})
+    if hidden:
+        st.info(f"{hidden} further potential match(es) are in other service lines. Details are restricted to the "
+                "Risk Lead, who will review them when you submit.")
+
+
 def page_data_entry() -> None:
     user = _page_user("create_check")
     st.title("📝 New Conflict Check")
@@ -602,53 +527,303 @@ def page_data_entry() -> None:
         st.error("You have no service line assigned. Ask an Admin to assign one.")
         st.stop()
     n = st.session_state.setdefault("_de_nonce", 0)
-    k = lambda name: f"de_{name}_{n}"          # new nonce after a successful save = fresh empty form
-    scope = st.radio("Engagement scope", config.SCOPES, horizontal=True, key=k("scope"),
-                     help="Global engagements need a Tax ID and country instead of PAN / GSTIN / CIN.")
-    with st.form(f"de_form_{n}"):
-        a, b = st.columns(2)
-        sl_opts = {f"{c} - {nm}": i for i, c, nm in lines}
-        sl_label = a.selectbox("Service line *", list(sl_opts), key=k("sl"))
-        party_type = b.radio("Entity type *", config.PARTY_TYPES, horizontal=True, key=k("ptype"))
-        name = st.text_input("Entity name *", max_chars=300, key=k("name"), placeholder="Legal name of the client / vendor")
-        pan = gstin = cin = tax_id = country = None
-        if scope == "Domestic":
-            c1, c2, c3 = st.columns(3)
-            pan = c1.text_input("PAN", max_chars=10, key=k("pan"))
-            gstin = c2.text_input("GSTIN", max_chars=15, key=k("gstin"))
-            cin = c3.text_input("CIN / LLPIN", max_chars=21, key=k("cin"))
-        else:
-            c1, c2 = st.columns(2)
-            tax_id = c1.text_input("Tax ID / registration no.", max_chars=50, key=k("taxid"))
-            country = c2.text_input("Country *", max_chars=60, key=k("country"))
-        desc = st.text_area("Engagement description", key=k("desc"), height=100)
-        st.markdown("**Related parties** (parent, subsidiaries, promoters, counterparties) - add rows as needed")
-        rel_df = st.data_editor(
-            pd.DataFrame({"name": pd.Series(dtype="str"), "relationship": pd.Series(dtype="str"),
-                          "identifier": pd.Series(dtype="str")}),
-            num_rows="dynamic", hide_index=True, key=k("rel"),
-            column_config={"name": "Name", "relationship": "Relationship", "identifier": "PAN / ID"})
-        d1, d2, _ = st.columns([1, 1, 2])
-        draft = d1.form_submit_button("💾 Save as draft")
-        submit = d2.form_submit_button("📨 Submit for review", type="primary")
+    k = lambda name: f"de_{name}_{n}"          # a new nonce after a successful save = fresh empty page
+    sl_opts = {f"{c} - {nm}": i for i, c, nm in lines}
+
+    st.markdown("##### 1 · Entity")
+    a, b, c = st.columns(3)
+    party_type = a.radio("Entity type *", config.PARTY_TYPES, horizontal=True, key=k("ptype"))
+    scope = b.radio("Engagement scope *", config.SCOPES, horizontal=True, key=k("scope"),
+                    help="Global = international. It changes the identifiers and the documents required.")
+    sl_label = c.selectbox("Service line *", list(sl_opts), key=k("sl"))
+    name = st.text_input("Entity name *", max_chars=300, key=k("name"), placeholder="Legal name of the client / vendor")
+    pan = gstin = cin = tax_id = country = None
+    if scope == "Domestic":
+        c1, c2, c3 = st.columns(3)
+        pan = c1.text_input("PAN", max_chars=10, key=k("pan"))
+        gstin = c2.text_input("GSTIN", max_chars=15, key=k("gstin"))
+        cin = c3.text_input("CIN / LLPIN", max_chars=21, key=k("cin"))
+    else:
+        c1, c2 = st.columns(2)
+        tax_id = c1.text_input("Tax ID / registration no.", max_chars=50, key=k("taxid"))
+        country = c2.text_input("Country *", max_chars=60, key=k("country"))
+    desc = st.text_area("Engagement description", key=k("desc"), height=90)
+    st.markdown("**Related parties** (parent, subsidiaries, promoters, counterparties). Add one row per party.")
+    rel_df = st.data_editor(
+        pd.DataFrame({"name": pd.Series(dtype="str"), "relationship": pd.Series(dtype="str"),
+                      "identifier": pd.Series(dtype="str")}),
+        num_rows="dynamic", hide_index=True, key=k("rel"),
+        column_config={"name": "Name", "relationship": "Relationship", "identifier": "PAN / ID"})
+    rel_rows = rel_df.to_dict("records")
+
+    st.markdown("##### 2 · Live conflict screening")
+    matches, hidden = workflow.screen_entity(
+        user, name=name or "", related_names=[r.get("name") or "" for r in rel_rows],
+        pan=pan, gstin=gstin, cin=cin, tax_id=tax_id)
+    render_screening(user, matches, hidden, typed=len(normalize_name(name or "")) >= config.FUZZY_MIN_LEN)
+
+    st.markdown("##### 3 · Documents")
+    reqs = workflow.required_docs(party_type, scope)
+    st.caption(f"Required for a {party_type.lower()} / {scope.lower()} engagement. Fields marked * must be attached to submit "
+               f"(PDF, image, Word, Excel; max {config.MAX_UPLOAD_MB} MB each). You can save a draft without them.")
+    uploads, got = [], 0
+    cols = st.columns(2)
+    for i, (key, required) in enumerate(reqs):
+        f = cols[i % 2].file_uploader(f"{workflow.doc_label(key)}{' *' if required else ' (if applicable)'}",
+                                      type=UPLOAD_TYPES, key=k(f"doc_{key}_{party_type}_{scope}"))
+        if f is not None:
+            uploads.append({"doc_type": key, "filename": f.name, "data": f.getvalue()})
+            got += bool(required)
+    extra = st.file_uploader("Other supporting documents (optional)", type=UPLOAD_TYPES, accept_multiple_files=True,
+                             key=k("doc_other"))
+    uploads += [{"doc_type": "OTHER", "filename": x.name, "data": x.getvalue()} for x in extra or []]
+    need = sum(1 for _, r in reqs if r)
+    st.progress(got / need if need else 1.0, text=f"{got} of {need} required documents attached")
+
+    st.markdown("##### 4 · Final check")
+    gst_banner()
+    confirm = st.checkbox(config.FINAL_REVIEW_TEXT, key=k("confirm"))
+    d1, d2, _ = st.columns([1, 1, 2])
+    draft = d1.button("💾 Save as draft", key=k("btn_draft"))
+    submit = d2.button("📨 Submit for review", type="primary", disabled=not confirm, key=k("btn_submit"),
+                       help="Tick the final review confirmation to enable submission.")
+    if not confirm:
+        st.caption("Tick the confirmation above to enable **Submit for review**.")
 
     if draft or submit:
         ok, res = run_action(
-            create_check, user, service_line_id=sl_opts[sl_label], party_type=party_type, scope=scope,
-            party_name=name, pan=pan, gstin=gstin, cin=cin, tax_id=tax_id, country=country, description=desc,
-            related=rel_df.to_dict("records"), submit=bool(submit))
+            create_check, user, service_line_id=sl_opts[sl_label], party_type=party_type, scope=scope, party_name=name,
+            pan=pan, gstin=gstin, cin=cin, tax_id=tax_id, country=country, description=desc, related=rel_rows,
+            uploads=uploads, submit=bool(submit), confirm_review=bool(confirm))
         if ok:
-            msg = f"{'Submitted' if submit else 'Saved as draft'}: {res['reference_no']}."
-            if res["matches"]:
-                if user.service_line_ids is None:
-                    msg += " ⚠️ Possible existing records: " + "; ".join(
-                        f"{m['reference_no']} ({m['service_line']}, {m['party_name']}, {m['matched_on']})" for m in res["matches"][:5])
-                else:
-                    msg += (f" ⚠️ {len(res['matches'])} possible existing record(s) elsewhere in the firm - "
-                            "the Risk Lead will review them.")
-            flash("warning" if res["matches"] else "success", msg)
+            vis, hid = workflow.partition_matches(user, res["matches"])
+            msg = f"{'Submitted' if submit else 'Saved as draft'}: {res['reference_no']} ({res['documents']} document(s))."
+            if vis:
+                msg += " ⚠️ Possible existing records: " + "; ".join(
+                    f"{m['reference_no']} ({m['service_line']}, {m['party_name']}, {m['score']}%)" for m in vis[:5])
+            if hid:
+                msg += f" ⚠️ {hid} further potential match(es) elsewhere in the firm will be reviewed by the Risk Lead."
+            flash("warning" if (vis or hid) else "success", msg)
             st.session_state["_de_nonce"] = n + 1
             st.rerun()
+
+
+@st.dialog("Final check before submitting")
+def submit_dialog(user: auth.SessionUser, check_id: int, ref: str, missing: list[str]) -> None:
+    gst_banner()
+    if missing:
+        st.error("Required documents still missing: " + ", ".join(missing) + ". Upload them in the Documents tab first.")
+    ok = st.checkbox(config.FINAL_REVIEW_TEXT, key=f"dlg_confirm_{check_id}")
+    c1, c2 = st.columns(2)
+    if c1.button("Confirm & submit", type="primary", disabled=(not ok) or bool(missing), key=f"dlg_go_{check_id}"):
+        done, _ = run_action(workflow.submit_check, user, check_id, confirm_review=True)
+        if done:
+            flash("success", f"{ref} submitted for review.")
+            st.rerun()
+    if c2.button("Cancel", key=f"dlg_cancel_{check_id}"):
+        st.rerun()
+
+
+def _log_download(doc_id: int) -> None:
+    try:
+        workflow.log_document_download(st.session_state.get("_user"), doc_id)
+    except Exception:
+        log.exception("Could not audit-log a document download")
+
+
+def _human_size(n) -> str:
+    n = n or 0
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(n, 1) / 1024:.0f} KB"
+
+
+def _render_documents(user: auth.SessionUser, d: dict) -> None:
+    chk = d["checklist"]
+    req = [x for x in chk if x["required"]]
+    done = sum(1 for x in req if x["present"])
+    st.progress(done / len(req) if req else 1.0, text=f"{done} of {len(req)} required documents attached")
+    by_key = {x["key"]: x for x in d["docs"]}
+    rows = [{"Document": x["label"], "Requirement": "Required" if x["required"] else "Optional",
+             "Status": "✅ Attached" if x["present"] else ("❌ Missing" if x["required"] else "➖ Not provided"),
+             "File": (by_key.get(x["key"]) or {}).get("filename"),
+             "SHA-256": ((by_key.get(x["key"]) or {}).get("sha256") or "")[:16],
+             "Uploaded": (by_key.get(x["key"]) or {}).get("uploaded_at")} for x in chk]
+    in_list = {x["key"] for x in chk}
+    rows += [{"Document": x["label"], "Requirement": "System" if x["key"] == "APPROVAL_CERTIFICATE" else "Extra",
+              "Status": "✅ Attached", "File": x["filename"], "SHA-256": (x["sha256"] or "")[:16], "Uploaded": x["uploaded_at"]}
+             for x in d["docs"] if x["key"] not in in_list]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={
+        "Uploaded": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm")})
+
+    is_maker_draft = d["requested_by_id"] == user.id and d["status"] == "DRAFT"
+    reviewer_extra = auth.can(user, "decide_conflict") and d["status"] in ("SUBMITTED", "ALIGNMENT_PENDING", "ALIGNMENT_CONFIRMED")
+    if is_maker_draft or reviewer_extra:
+        with st.container(border=True):
+            st.markdown("**Add / replace a document**")
+            opts = ([(x["key"], x["label"]) for x in chk] + [("OTHER", config.DOC_LABELS["OTHER"])]) if is_maker_draft \
+                else [("ALIGNMENT_PROOF", config.DOC_LABELS["ALIGNMENT_PROOF"]), ("OTHER", config.DOC_LABELS["OTHER"])]
+            un = st.session_state.setdefault(f"_up_nonce_{d['id']}", 0)
+            kind = st.selectbox("Document type", [k for k, _ in opts], format_func=workflow.doc_label, key=f"up_kind_{d['id']}_{un}")
+            f = st.file_uploader("File", type=UPLOAD_TYPES, key=f"up_file_{d['id']}_{un}")
+            if st.button("⬆️ Upload", key=f"up_btn_{d['id']}_{un}", disabled=f is None):
+                ok, cnt = run_action(workflow.attach_documents, user, d["id"],
+                                     [{"doc_type": kind, "filename": f.name, "data": f.getvalue()}])
+                if ok:
+                    flash("success", f"{workflow.doc_label(kind)} uploaded.")
+                    st.session_state[f"_up_nonce_{d['id']}"] = un + 1
+                    st.rerun()
+
+    opts = {f"{x['label']} - {x['filename']}": x for x in d["docs"] if not x["external"]}
+    if opts:
+        st.markdown("**Open / verify a document**")
+        labels = list(opts)
+        default = next((i for i, lab in enumerate(labels) if opts[lab]["key"] == "APPROVAL_CERTIFICATE"), 0)
+        sel = opts[st.selectbox("Document", labels, index=default, key=f"docpick_{d['id']}")]
+        try:
+            fname, data, _v = workflow.read_document(user, sel["id"])
+        except RuleViolation as exc:
+            st.error(f"🚨 {exc}")
+        else:
+            st.success(f"✅ Integrity verified: SHA-256 matches the value recorded at upload ({sel['sha256'][:16]}…, {_human_size(sel['size'])}).")
+            st.download_button(f"⬇️ Download {fname}", data, file_name=fname, key=f"dl_doc_{sel['id']}",
+                               on_click=_log_download, args=(sel["id"],))
+        if st.button("🛡️ Verify ALL documents of this check", key=f"verify_all_{d['id']}"):
+            ok, res = run_action(workflow.verify_check_documents, user, d["id"])
+            if ok:
+                bad = [x for x in res if x["ok"] is False]
+                (st.error if bad else st.success)(f"{len(res) - len(bad)} of {len(res)} verified." + (
+                    " FAILED: " + ", ".join(x["label"] for x in bad) if bad else ""))
+
+
+def _render_actions(user: auth.SessionUser, d: dict) -> None:
+    cid, status = d["id"], d["status"]
+    is_maker = d["requested_by_id"] == user.id
+    if d["limited"] and status != "ALIGNMENT_PENDING":
+        return
+
+    # ---- maker: submit / edit / withdraw
+    if is_maker and status == "DRAFT":
+        c1, c2 = st.columns([1, 3])
+        if c1.button("📨 Submit for review", key=f"sub_{cid}", type="primary"):
+            submit_dialog(user, cid, d["reference_no"], d["missing"])
+        if d["missing"]:
+            c2.caption("Missing required documents: " + ", ".join(d["missing"]))
+        with st.expander("✏️ Edit draft"):
+            with st.form(f"edit_{cid}"):
+                pt = st.radio("Entity type", config.PARTY_TYPES, horizontal=True, index=config.PARTY_TYPES.index(d["party_type"]))
+                sc = st.radio("Scope", config.SCOPES, horizontal=True, index=config.SCOPES.index(d["scope"]))
+                nm = st.text_input("Entity name", value=d["party_name"])
+                e1, e2, e3, e4 = st.columns(4)
+                pan = e1.text_input("PAN", value=d["pan"] or ""); gst = e2.text_input("GSTIN", value=d["gstin"] or "")
+                cin = e3.text_input("CIN / LLPIN", value=d["cin"] or ""); tax = e4.text_input("Tax ID", value=d["tax_id"] or "")
+                ctry = st.text_input("Country (Global)", value=d["country"] or "")
+                ds = st.text_area("Engagement description", value=d["description"] or "")
+                if st.form_submit_button("Save changes"):
+                    ok, _ = run_action(workflow.update_draft, user, cid, party_type=pt, scope=sc, party_name=nm, pan=pan,
+                                       gstin=gst, cin=cin, tax_id=tax, country=ctry, description=ds)
+                    if ok:
+                        flash("success", "Draft updated."); st.rerun()
+    if is_maker and status in ("DRAFT", "SUBMITTED"):
+        with st.expander("Withdraw this check"):
+            reason = st.text_input("Reason (required)", key=f"wd_reason_{cid}")
+            if st.button("Withdraw", key=f"wd_{cid}"):
+                ok, ref = run_action(workflow.withdraw_check, user, cid, reason)
+                if ok:
+                    flash("success", f"{ref} withdrawn."); st.rerun()
+
+    # ---- Risk Lead: the two-option decision
+    if status == "SUBMITTED" and auth.can(user, "decide_conflict"):
+        with st.container(border=True):
+            st.markdown("#### ⚖️ Conflict decision")
+            ok_to_review, why = review_eligibility(user, d["requested_by_id"])
+            if not ok_to_review:
+                st.warning("🚫 Maker-checker: " + why)
+            else:
+                st.caption("Review the Screening tab first, then choose one option.")
+                opt = st.radio("Decision", ["A", "B"], key=f"opt_{cid}", horizontal=True,
+                               format_func=lambda x: "Option A: Approved (no conflict)" if x == "A"
+                               else "Option B: Partner alignment needed")
+                notes = st.text_area("Notes" + (" (required: describe the potential conflict)" if opt == "B" else " (optional)"),
+                                     key=f"dec_notes_{cid}")
+                partner_id = None
+                if opt == "B":
+                    cands = workflow.list_partner_candidates({d["requested_by_id"], user.id})
+                    if not cands:
+                        st.error("No eligible partner exists. An Admin must flag a user as an eligible partner first.")
+                    else:
+                        labels = {c["id"]: f"{c['name']} ({c['username']})" for c in cands}
+                        partner_id = st.selectbox("Aligned partner", list(labels), format_func=labels.get, key=f"partner_{cid}")
+                if st.button("✅ Record decision", type="primary", key=f"decide_{cid}", disabled=(opt == "B" and partner_id is None)):
+                    if opt == "A":
+                        ok, res = run_action(workflow.decide_approve, user, cid, notes)
+                        if ok:
+                            flash("success", f"{res['reference_no']} approved. Certificate issued (SHA-256 {res['certificate_sha256'][:12]}…). "
+                                  "Client acceptance is now unlocked."); st.rerun()
+                    else:
+                        ok, res = run_action(workflow.decide_alignment, user, cid, partner_id, notes)
+                        if ok:
+                            flash("success", f"{res['reference_no']} sent to {res['partner']} for alignment sign-off."); st.rerun()
+            with st.expander("Reject this check"):
+                rr = st.text_input("Reason (required)", key=f"rej_reason_{cid}")
+                if st.button("Reject", key=f"rej_{cid}", disabled=not ok_to_review):
+                    ok, ref = run_action(workflow.reject_check, user, cid, rr)
+                    if ok:
+                        flash("success", f"{ref} rejected."); st.rerun()
+
+    # ---- aligned partner sign-off (or waiting)
+    if status == "ALIGNMENT_PENDING":
+        with st.container(border=True):
+            st.markdown("#### 🤝 Partner alignment")
+            if auth.can_confirm_alignment(user, d["aligned_partner_id"]):
+                st.info(f"The Risk Lead ({d['decided_by']}) asked you to align on this check.")
+                st.markdown(f"> {d['decision_notes']}")
+                notes = st.text_area("Your sign-off notes (required)", key=f"align_notes_{cid}")
+                sure = st.checkbox("I confirm I have aligned with the teams involved and sign off on this check.", key=f"align_sure_{cid}")
+                c1, c2 = st.columns(2)
+                if c1.button("✍️ Confirm & sign off", type="primary", key=f"align_ok_{cid}", disabled=not sure):
+                    ok, ref = run_action(workflow.confirm_alignment, user, cid, notes)
+                    if ok:
+                        flash("success", f"{ref}: your sign-off is recorded. The Risk Lead can now clear the check."); st.rerun()
+                with st.expander("Decline alignment (conflict stands)"):
+                    reason = st.text_input("Reason (required)", key=f"align_no_reason_{cid}")
+                    if st.button("Decline", key=f"align_no_{cid}"):
+                        ok, ref = run_action(workflow.decline_alignment, user, cid, reason)
+                        if ok:
+                            flash("warning", f"{ref} rejected: alignment declined."); st.rerun()
+            else:
+                st.info(f"Waiting for **{d['aligned_partner']}** to sign off. Only the designated partner can do this.")
+
+    # ---- Risk Lead: clear after partner sign-off
+    if status == "ALIGNMENT_CONFIRMED" and auth.can(user, "decide_conflict"):
+        with st.container(border=True):
+            st.markdown("#### ✅ Clear after partner sign-off")
+            st.success(f"{d['aligned_partner']} signed off on {d['alignment_confirmed_at']:%d %b %Y, %H:%M}: {d['alignment_notes']}")
+            ok_to_review, why = review_eligibility(user, d["requested_by_id"])
+            if not ok_to_review:
+                st.warning("🚫 Maker-checker: " + why)
+            else:
+                final = st.text_area("Final clearance notes (required)", key=f"final_notes_{cid}")
+                proofs = st.file_uploader("Alignment proof (optional, one or more files)", type=UPLOAD_TYPES,
+                                          accept_multiple_files=True, key=f"final_proof_{cid}")
+                if st.button("📜 Clear check & issue certificate", type="primary", key=f"clear_{cid}"):
+                    ok, res = run_action(workflow.clear_aligned_check, user, cid, final,
+                                         [{"doc_type": "ALIGNMENT_PROOF", "filename": x.name, "data": x.getvalue()} for x in proofs or []])
+                    if ok:
+                        flash("success", f"{res['reference_no']} cleared. Certificate issued (SHA-256 {res['certificate_sha256'][:12]}…)."); st.rerun()
+
+    # ---- Risk Lead: client acceptance
+    if status in config.ACCEPTANCE_UNLOCKED_STATES and d["acceptance"] == "PENDING" and auth.can(user, "grant_acceptance"):
+        with st.container(border=True):
+            st.markdown("#### 🏁 Client acceptance")
+            ok_to_review, why = review_eligibility(user, d["requested_by_id"])
+            if not ok_to_review:
+                st.warning("🚫 Maker-checker: " + why)
+            else:
+                choice = st.radio("Outcome", ["Accept", "Decline"], horizontal=True, key=f"acc_choice_{cid}")
+                notes = st.text_area("Notes (required)", key=f"acc_notes_{cid}")
+                if st.button("Record acceptance decision", type="primary", key=f"acc_{cid}"):
+                    ok, ref = run_action(workflow.record_acceptance, user, cid, choice == "Accept", notes)
+                    if ok:
+                        flash("success", f"{ref}: client acceptance {'granted' if choice == 'Accept' else 'declined'}."); st.rerun()
 
 
 def render_detail(user: auth.SessionUser, check_id: int) -> None:
@@ -657,43 +832,57 @@ def render_detail(user: auth.SessionUser, check_id: int) -> None:
         st.warning("That record is not available to you.")
         return
     st.subheader(f"{d['reference_no']} · {d['party_name']}")
-    tabs = ["Overview", "Related parties & proofs"] + (["Audit trail"] if auth.can(user, "view_audit") else [])
-    t = st.tabs(tabs)
-    with t[0]:
+    if d["limited"]:
+        st.info("You can open this check only because you are its designated aligned partner. "
+                "Documents and the audit trail are restricted to the service line.")
+    labels = ["Overview"]
+    if not d["limited"]:
+        labels.append("Documents")
+    labels.append("Related parties & screening")
+    if auth.can(user, "view_audit") and not d["limited"]:
+        labels.append("Audit trail")
+    tabs = dict(zip(labels, st.tabs(labels)))
+
+    with tabs["Overview"]:
         a, b, c = st.columns(3)
         a.markdown(f"**Service line**  \n{d['service_line']}\n\n**Type / scope**  \n{d['party_type']} · {d['scope']}"
                    + (f" · {d['country']}" if d["country"] else ""))
         b.markdown(f"**Conflict status**  \n{pretty(d['status'])}\n\n**Decision**  \n{pretty(d['decision']) or '-'}\n\n"
                    f"**Acceptance**  \n{pretty(d['acceptance'])}")
         c.markdown(f"**Raised by**  \n{d['requested_by']}\n\n**Created**  \n{d['created_at']:%d %b %Y, %H:%M}"
-                   + (f"\n\n**Source**  \nLegacy import" if d["source"] == "legacy_import" else ""))
+                   + ("\n\n**Source**  \nLegacy import" if d["source"] == "legacy_import" else ""))
         ids = {k.upper(): d[k] for k in ("pan", "gstin", "cin", "tax_id") if d[k]}
         if ids: st.markdown("**Identifiers:** " + " · ".join(f"{k}: `{v}`" for k, v in ids.items()))
         if d["description"]: st.markdown(f"**Engagement:** {d['description']}")
-        if d["decided_by"] or d["aligned_partner"]:
-            st.markdown(f"**Decided by:** {d['decided_by'] or '-'} · **Aligned partner:** {d['aligned_partner'] or '-'}")
+        events = [("Raised", d["created_at"], d["requested_by"], None)]
+        if d["decided_at"]: events.append((f"Decision: {pretty(d['decision']) or 'Rejected'}", d["decided_at"], d["decided_by"], d["decision_notes"]))
+        if d["alignment_confirmed_at"]: events.append(("Partner sign-off", d["alignment_confirmed_at"], d["aligned_partner"], d["alignment_notes"]))
+        if d["cleared_at"]: events.append(("Cleared", d["cleared_at"], d["cleared_by"], d["clearance_notes"]))
+        if d["accepted_at"]: events.append((f"Acceptance: {pretty(d['acceptance'])}", d["accepted_at"], d["accepted_by"], d["acceptance_notes"]))
+        if len(events) > 1 or d["status"] != "DRAFT":
+            st.dataframe(pd.DataFrame(events, columns=["Step", "When (IST)", "By", "Notes"]), hide_index=True, column_config={
+                "When (IST)": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm")})
+        cert = next((x for x in d["docs"] if x["key"] == "APPROVAL_CERTIFICATE"), None)
+        if cert:
+            st.success(f"📜 Approval certificate issued · SHA-256 `{cert['sha256'][:24]}…` · open it in the Documents tab.")
         st.divider()
-        is_maker = d["requested_by_id"] == user.id
-        if is_maker and d["status"] == "DRAFT":
-            if st.button("📨 Submit for review", key=f"sub_{d['id']}", type="primary"):
-                ok, ref = run_action(maker_action, user, d["id"], "SUBMITTED")
-                if ok: flash("success", f"{ref} submitted for review."); st.rerun()
-        if is_maker and d["status"] in ("DRAFT", "SUBMITTED"):
-            with st.expander("Withdraw this check"):
-                reason = st.text_input("Reason (required)", key=f"wd_reason_{d['id']}")
-                if st.button("Withdraw", key=f"wd_{d['id']}"):
-                    ok, ref = run_action(maker_action, user, d["id"], "WITHDRAWN", reason)
-                    if ok: flash("success", f"{ref} withdrawn."); st.rerun()
-        if d["status"] == "SUBMITTED" and auth.can(user, "decide_conflict"):
-            eligible, why = review_eligibility(user, d["requested_by_id"])
-            (st.info if eligible else st.warning)(("✅ " if eligible else "🚫 Maker-checker: ") + why)
-    with t[1]:
+        _render_actions(user, d)
+
+    if "Documents" in tabs:
+        with tabs["Documents"]:
+            _render_documents(user, d)
+
+    with tabs["Related parties & screening"]:
         st.markdown("**Related parties**")
         st.dataframe(pd.DataFrame(d["related"]), hide_index=True) if d["related"] else st.caption("None recorded.")
-        st.markdown("**Proof documents**")
-        st.dataframe(pd.DataFrame(d["proofs"]), hide_index=True) if d["proofs"] else st.caption("None attached yet (upload arrives in Part 3).")
-    if len(t) > 2:
-        with t[2]:
+        if not d["limited"]:
+            st.markdown("**Conflict screening against the whole firm**")
+            m, hid = workflow.screen_entity(user, name=d["party_name"], related_names=[r["Name"] for r in d["related"]],
+                                            pan=d["pan"], gstin=d["gstin"], cin=d["cin"], tax_id=d["tax_id"], exclude_id=d["id"])
+            render_screening(user, m, hid, typed=True)
+
+    if "Audit trail" in tabs:
+        with tabs["Audit trail"]:
             trail = audit.get_entity_trail("conflict_check", d["id"])
             if trail:
                 tdf = pd.DataFrame(trail)
@@ -703,6 +892,32 @@ def render_detail(user: auth.SessionUser, check_id: int) -> None:
                              hide_index=True)
             else:
                 st.caption("No audit entries.")
+
+
+def page_queue() -> None:
+    user = _page_user("view_records")
+    st.title("📥 Action Queue")
+    st.caption("Everything waiting for you: drafts to finish, checks to decide, alignments to sign off, acceptances to record.")
+    q = workflow.fetch_queue(user)
+    if q.empty:
+        st.success("Nothing needs your action right now.")
+        return
+    actionable = q[~q["action"].str.startswith("Waiting")]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Needs your action", len(actionable))
+    m2.metric("Waiting on someone else", len(q) - len(actionable))
+    m3.metric(f"Older than {OVERDUE_DAYS} days", int((actionable["age_days"] > OVERDUE_DAYS).sum()))
+    view = q[["id", "reference_no", "party_name", "service_line", "scope", "status", "action", "age_days", "raised_by"]]
+    event = st.dataframe(view, hide_index=True, on_select="rerun", selection_mode="single-row", key="queue_tbl",
+                         column_config={"id": None, "reference_no": "Reference", "party_name": "Entity", "service_line": "Line",
+                                        "scope": "Scope", "status": "Status", "action": "Action needed",
+                                        "age_days": st.column_config.NumberColumn("Age (days)"), "raised_by": "Raised by"})
+    rows = event.selection.rows if event and event.selection else []
+    if rows and rows[0] < len(q):
+        st.divider()
+        render_detail(user, int(q.iloc[rows[0]]["id"]))
+    else:
+        st.caption("Tick a row to open it and act.")
 
 
 def page_records() -> None:
@@ -715,7 +930,7 @@ def page_records() -> None:
     h1, h2 = st.columns([3, 1])
     h1.caption(f"{len(df):,} record(s). Click a column header to sort; tick a row to open it.")
     with h2:
-        export_button(df.drop(columns=["id", "age_days"]), "records", f)
+        export_button(user, f, "records", lambda: export_dataframe(user, f))
     view = df[["id", "reference_no", "service_line", "party_name", "party_type", "scope", "conflict_status",
                "acceptance_status", "requested_by", "created_at", "pan", "gstin", "cin", "tax_id"]].copy()
     view["conflict_status"] = view["conflict_status"].map(pretty)
@@ -774,12 +989,10 @@ def page_reports() -> None:
             st.plotly_chart(fig, key="rep_age")
 
     st.subheader("Summary table")
-    piv = pd.pivot_table(df, index="service_line", columns="conflict_status", values="id", aggfunc="count", fill_value=0)
-    piv.columns = [pretty(c) for c in piv.columns]
-    piv["Total"] = piv.sum(axis=1)
-    piv.loc["TOTAL"] = piv.sum()
+    piv = summary_pivot(user, f)
     st.dataframe(piv)
-    export_button(piv.reset_index().rename(columns={"service_line": "Service line"}), "summary", f, "⬇️ Export summary CSV")
+    export_button(user, f, "summary", lambda: summary_pivot(user, f).reset_index().rename(columns={"service_line": "Service line"}),
+                  label="summary CSV")
 
 
 def _diagnostics_report(user: auth.SessionUser) -> dict:
@@ -797,6 +1010,7 @@ def _diagnostics_report(user: auth.SessionUser) -> dict:
         "db_size_mb": round(config.DB_PATH.stat().st_size / 1e6, 2) if config.DB_PATH.exists() else None,
         "health": database.health_check(), "audit_chain": asdict(chain), "row_counts": counts,
         "latest_backup": (bks[0]["path"].name if bks else None), "backup_count": len(bks),
+        "excel_sync": excel_sync.status(),
         "error_log_tail": tail_file(config.LOG_DIR / "error.log", 100),
     }
 
@@ -807,7 +1021,7 @@ def page_diagnostics() -> None:
     labels = ["🔗 Audit chain"]
     full = auth.can(user, "view_diagnostics")
     if full:
-        labels += ["💚 System health", "🧾 Error log", "💾 Backups"]
+        labels += ["💚 System health", "🧾 Error log", "💾 Backups", "📊 Excel sync"]
     tabs = st.tabs(labels)
 
     with tabs[0]:
@@ -884,6 +1098,21 @@ def page_diagnostics() -> None:
         else:
             st.info("No backups yet.")
         st.caption("Restoring is deliberately command-line only: stop the app, then `python backup.py restore <file>`.")
+    with tabs[4]:
+        es = excel_sync.status()
+        (st.error if es["last_error"] else st.success)(
+            ("Last sync FAILED (will retry automatically): " + es["last_error"]) if es["last_error"]
+            else "Excel tracker is in step with the database." if es["last_ok"] else "No sync has completed yet.")
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Last successful sync", f"{es['last_ok']:%d %b %H:%M:%S}" if es["last_ok"] else "-")
+        e2.metric("Records in file", es["records"] if es["records"] is not None else "-")
+        e3.metric("Pending / failures", f"{'yes' if es['dirty'] else 'no'} / {es['failures']}")
+        st.caption(f"Master file: `{es['master_file']}`" + (f" · modified {es['master_mtime']:%d %b %Y %H:%M:%S}" if es["master_mtime"] else ""))
+        st.caption(f"Proof links in the workbook resolve against: `{config.EXCEL_LINK_ROOT}` (set CCP_LINK_ROOT to the shared path users can open).")
+        if st.button("🔄 Sync now", key="excel_sync_now"):
+            excel_sync.request_sync("manual", immediate=True)
+            st.info("Sync queued: it runs in the background within a few seconds. Refresh this tab to see the result.")
+        st.caption("The workbook is read-only OUTPUT: edits are overwritten. A locked file (open in Excel) is retried automatically; saves are never blocked.")
 
 
 def _repair_log(user, action: str, detail: dict) -> None:
@@ -968,7 +1197,8 @@ def page_admin() -> None:
 
 # ============================================================================ 4. MAIN
 def build_pages(user: auth.SessionUser) -> list:
-    pages = [st.Page(page_dashboard, title="Dashboard", icon="📊", url_path="dashboard", default=True)]
+    pages = [st.Page(page_dashboard, title="Dashboard", icon="📊", url_path="dashboard", default=True),
+             st.Page(page_queue, title="Action Queue", icon="📥", url_path="queue")]
     if auth.can(user, "create_check"):
         pages.append(st.Page(page_data_entry, title="Data Entry", icon="📝", url_path="data-entry"))
     pages += [st.Page(page_records, title="Records Table", icon="🗂️", url_path="records"),

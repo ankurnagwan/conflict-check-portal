@@ -84,6 +84,9 @@ def read_scope() -> Iterator[Session]:
     s = SessionLocal()
     try:
         yield s
+    except RuleViolation:                 # expected refusals (access denied...) are not system errors
+        s.rollback()
+        raise
     except Exception:
         s.rollback()
         log.exception("Database read failed")
@@ -246,6 +249,8 @@ class ConflictCheck(Base):
     alignment_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     alignment_notes: Mapped[Optional[str]] = mapped_column(Text)
     cleared_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    cleared_by_id: Mapped[Optional[int]] = mapped_column(Integer)     # Risk Lead who cleared (no FK: added via ALTER in 0002)
+    clearance_notes: Mapped[Optional[str]] = mapped_column(Text)
 
     acceptance_status: Mapped[str] = mapped_column(String(20), default="LOCKED")
     accepted_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))

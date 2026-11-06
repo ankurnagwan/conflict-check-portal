@@ -11,4 +11,5 @@ plotly>=5.20,<7
 pandas>=2.1,<3
 rapidfuzz>=3.6,<4
 reportlab>=4.0,<5      # PDF Approval Certificate
-xlsxwriter>=3.1,<4     # Excel sync engine
+# Test-only (smoke tests read the generated PDF certificates):
+pypdf>=4,<6
