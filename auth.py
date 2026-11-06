@@ -74,7 +74,8 @@ PERMISSIONS: dict[str, frozenset] = {
     "grant_acceptance":    frozenset({R.ROLE_RISK_LEAD}),
     "export_reports":      frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD, R.ROLE_AUDITOR}),
     "view_audit":          frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD, R.ROLE_AUDITOR}),
-    "verify_audit":        frozenset({R.ROLE_ADMIN, R.ROLE_AUDITOR}),
+    "verify_audit":        frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD, R.ROLE_AUDITOR}),
+    "view_diagnostics":    frozenset({R.ROLE_ADMIN, R.ROLE_RISK_LEAD}),   # health, error log, backups
     "manage_users":        frozenset({R.ROLE_ADMIN}),
     "manage_service_lines": frozenset({R.ROLE_ADMIN}),
     "run_diagnostics":     frozenset({R.ROLE_ADMIN}),
