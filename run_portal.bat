@@ -8,6 +8,7 @@ rem  builds/repairs everything (virtual environment, packages, folders, database
 rem  and starts the portal. The window stays open so you can read the log.
 rem  Close the window (or press Ctrl+C) to stop the portal.
 rem  Extra options are passed through, e.g.:  run_portal.bat --port 8600
+rem  Automation can set CCP_NO_PAUSE=1 to skip the final 'press any key'.
 rem ------------------------------------------------------------------------------
 pushd "%~dp0"
 
@@ -23,6 +24,7 @@ if not defined PY goto :nopython
 echo.
 echo  Using: %PY%
 echo  Folder: %CD%
+echo  The portal will open at http://localhost:8501 (your browser opens automatically).
 echo.
 %PY% bootstrap.py %*
 set "RC=%ERRORLEVEL%"
@@ -44,5 +46,5 @@ if "%RC%"=="0" (
 )
 echo.
 popd
-pause
+if not defined CCP_NO_PAUSE pause
 endlocal & exit /b %RC%

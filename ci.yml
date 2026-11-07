@@ -1,0 +1,45 @@
+# Runs on every push / pull request. Proves a fresh checkout works on Linux AND Windows.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fresh-checkout:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    env:
+      CCP_NO_BROWSER: "1"
+      CCP_NO_PAUSE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Exactly what a new user does: nothing but Python installed. Creates .venv, upgrades pip,
+      # installs requirements.txt, provisions folders, runs Alembic, initialises the database.
+      - name: Bootstrap (build .venv, install packages, create folders, migrate database)
+        run: python bootstrap.py --check
+
+      - name: Quick smoke tests (install integrity + real server launch)
+        run: python run_tests.py --quick
+
+      # The real one-click launcher on Windows (stops after preparing everything).
+      - name: run_portal.bat (Windows one-click launcher)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call run_portal.bat --check
+
+      # Full suites once, on the configuration they were developed and verified on.
+      - name: Full test suites
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: python run_tests.py

@@ -8,7 +8,7 @@ tzdata            # required on Windows for Asia/Kolkata
 # Needed from Part 2/3 onward:
 streamlit>=1.40,<2
 plotly>=5.20,<7
-pandas>=2.1,<3
+pandas>=2.2.0
 rapidfuzz>=3.6,<4
 reportlab>=4.0,<5      # PDF Approval Certificate
 # Test-only (smoke tests read the generated PDF certificates):
