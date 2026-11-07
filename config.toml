@@ -1,0 +1,13 @@
+# Applies when you run `streamlit run app.py` from this folder.
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
+maxUploadSize = 25          # MB per file: matches config.MAX_UPLOAD_MB
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

@@ -1,0 +1,34 @@
+# ===== NEVER COMMIT CLIENT DATA =====================================================
+# The database, KYC/proof documents, certificates, exports and backups hold confidential
+# client information. They must never reach GitHub, not even a private repository.
+data/
+backups/
+proofs/
+exports/
+*.db
+*.db-wal
+*.db-shm
+*.db.gz
+*.xlsx
+
+# ===== Secrets ======================================================================
+.env
+.env.*
+.streamlit/secrets.toml
+
+# ===== Python / environment =========================================================
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ===== Logs / OS / editors ==========================================================
+*.log
+alembic.ini.bak
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

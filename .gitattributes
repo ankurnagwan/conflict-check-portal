@@ -1,0 +1,13 @@
+# Keep Windows batch files CRLF (LF-only .bat files can break labels / goto on Windows)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Everything else: normalise to LF in the repo
+* text=auto
+*.py text eol=lf
+*.ini text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+# Never diff/merge binaries as text
+*.pdf binary
+*.png binary
+*.jpg binary
